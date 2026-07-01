@@ -1,0 +1,4 @@
+/target
+.env
+.claus/
+.DS_Store

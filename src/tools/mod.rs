@@ -1,4 +1,5 @@
 pub mod fs;
+pub mod rag;
 pub mod search;
 pub mod shell;
 

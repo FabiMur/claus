@@ -3,6 +3,7 @@
 mod agent;
 mod api;
 mod config;
+mod lsp;
 mod rag;
 mod tools;
 

@@ -4,6 +4,7 @@ mod agent;
 mod api;
 mod config;
 mod lsp;
+mod mcp;
 mod rag;
 mod tools;
 

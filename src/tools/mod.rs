@@ -1,5 +1,6 @@
 pub mod fs;
 pub mod lsp;
+pub mod mcp;
 pub mod rag;
 pub mod search;
 pub mod shell;

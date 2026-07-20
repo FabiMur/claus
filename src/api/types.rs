@@ -82,7 +82,6 @@ pub struct ApiRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ApiResponse {
-    pub id: String,
     pub content: Vec<ContentBlock>,
     pub stop_reason: String,
     pub usage: Usage,

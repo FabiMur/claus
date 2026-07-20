@@ -33,10 +33,6 @@ impl Client {
         }
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
     /// Send one turn; retries transient failures (429 / 5xx / network) with backoff.
     pub async fn send(
         &self,

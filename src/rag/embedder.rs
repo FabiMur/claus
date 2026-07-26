@@ -8,6 +8,10 @@ const MODEL: &str = "voyage-code-3";
 /// Output dimension of voyage-code-3 with default settings.
 pub const EMBEDDING_DIM: u64 = 1024;
 const BATCH_SIZE: usize = 128;
+/// Keep each request comfortably under free-tier token-per-minute limits.
+const MAX_BATCH_CHARS: usize = 30_000;
+const MAX_RATE_LIMIT_RETRIES: u32 = 8;
+const RATE_LIMIT_BACKOFF_SECS: u64 = 21;
 
 /// What the texts are used for; Voyage tunes the embedding accordingly.
 #[derive(Clone, Copy)]
@@ -52,15 +56,40 @@ impl Embedder {
     }
 
     /// Embed all texts, batching requests; result order matches input order.
+    /// Batches are bounded by item count and total size to respect rate limits.
     pub async fn embed(&self, texts: &[String], input_type: InputType) -> Result<Vec<Vec<f32>>> {
         let mut embeddings = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(BATCH_SIZE) {
-            embeddings.extend(self.embed_batch(batch, input_type).await?);
+        let mut batch: Vec<String> = Vec::new();
+        let mut batch_chars = 0;
+        for text in texts {
+            if !batch.is_empty() && (batch.len() >= BATCH_SIZE || batch_chars + text.len() > MAX_BATCH_CHARS) {
+                embeddings.extend(self.embed_batch(&batch, input_type).await?);
+                batch.clear();
+                batch_chars = 0;
+            }
+            batch_chars += text.len();
+            batch.push(text.clone());
+        }
+        if !batch.is_empty() {
+            embeddings.extend(self.embed_batch(&batch, input_type).await?);
         }
         Ok(embeddings)
     }
 
+    /// One request; waits out 429 responses (free-tier limits are per minute).
     async fn embed_batch(&self, batch: &[String], input_type: InputType) -> Result<Vec<Vec<f32>>> {
+        for _ in 0..MAX_RATE_LIMIT_RETRIES {
+            match self.embed_once(batch, input_type).await {
+                Err(error) if error.to_string().contains("429") => {
+                    tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_BACKOFF_SECS)).await;
+                }
+                other => return other,
+            }
+        }
+        bail!("voyage API still rate-limited after {MAX_RATE_LIMIT_RETRIES} retries")
+    }
+
+    async fn embed_once(&self, batch: &[String], input_type: InputType) -> Result<Vec<Vec<f32>>> {
         let response = self
             .http
             .post(VOYAGE_URL)

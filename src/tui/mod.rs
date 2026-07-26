@@ -36,6 +36,11 @@ pub struct App {
     spinner_tick: usize,
     model: String,
     usage: Usage,
+    /// Tokens of the latest API round-trip: approximates current context size.
+    context_tokens: u32,
+    context_window: u32,
+    cwd: String,
+    git_branch: Option<String>,
     prompt_tx: mpsc::UnboundedSender<String>,
     agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
 }
@@ -52,6 +57,7 @@ impl App {
             text: "claus — terminal coding agent. Enter sends, Esc quits, ↑/↓ scroll.".to_string(),
         }];
         entries.extend(startup_notes.into_iter().map(|text| Entry { kind: Kind::Info, text }));
+        let context_window = context_window_for(&model);
         Self {
             entries,
             input: String::new(),
@@ -60,6 +66,10 @@ impl App {
             spinner_tick: 0,
             model,
             usage: Usage::default(),
+            context_tokens: 0,
+            context_window,
+            cwd: abbreviated_cwd(),
+            git_branch: current_git_branch(),
             prompt_tx,
             agent_rx,
         }
@@ -171,11 +181,12 @@ impl App {
                     text: format!("  ↳ {name}: {first_line}"),
                 });
             }
-            AgentEvent::TurnComplete { usage } => {
+            AgentEvent::ApiUsage { usage } => {
+                self.context_tokens = usage.input_tokens + usage.output_tokens;
                 self.usage.input_tokens += usage.input_tokens;
                 self.usage.output_tokens += usage.output_tokens;
-                self.busy = false;
             }
+            AgentEvent::TurnComplete => self.busy = false,
             AgentEvent::Error(message) => {
                 self.entries.push(Entry {
                     kind: Kind::Error,
@@ -217,24 +228,92 @@ impl App {
             Paragraph::new(format!("{}█", self.input)).block(Block::default().borders(Borders::ALL).title(" prompt "));
         frame.render_widget(input, input_area);
 
-        // Status bar.
-        let spinner = if self.busy {
-            format!("{} working ", SPINNER[self.spinner_tick % SPINNER.len()])
-        } else {
-            String::new()
-        };
-        let status = Line::from(vec![
-            Span::styled(spinner, Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!(
-                    " {} · in {} out {} tokens ",
-                    self.model, self.usage.input_tokens, self.usage.output_tokens
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(status), status_area);
+        frame.render_widget(Paragraph::new(self.status_line()), status_area);
     }
+
+    /// Claude-Code-style status bar:
+    /// `📁 ~/Projects/x (main) · model · ▰▰▱▱▱▱▱▱▱▱ 22% · $0.53`
+    fn status_line(&self) -> Line<'_> {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::styled(
+            format!("📁 {}", self.cwd),
+            Style::default().fg(Color::Blue),
+        )];
+        if let Some(branch) = &self.git_branch {
+            spans.push(Span::styled(
+                format!(" ({branch})"),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            self.model.clone(),
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", dim));
+
+        let percent = (self.context_tokens as f64 / self.context_window as f64 * 100.0).min(100.0);
+        let filled = (percent / 10.0).round() as usize;
+        spans.push(Span::styled("▰".repeat(filled), Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled("▱".repeat(10 - filled.min(10)), dim));
+        spans.push(Span::styled(format!(" {percent:.0}%"), dim));
+
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!("${:.2}", session_cost_usd(&self.model, &self.usage)),
+            Style::default().fg(Color::Green),
+        ));
+
+        if self.busy {
+            spans.push(Span::styled(
+                format!("  {} working", SPINNER[self.spinner_tick % SPINNER.len()]),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        Line::from(spans)
+    }
+}
+
+/// Context window of the configured model, for the usage bar.
+fn context_window_for(model: &str) -> u32 {
+    if model.contains("haiku") { 200_000 } else { 1_000_000 }
+}
+
+/// Approximate cost in USD from (input, output) prices per million tokens.
+fn session_cost_usd(model: &str, usage: &Usage) -> f64 {
+    let (input_per_m, output_per_m) = if model.contains("fable") || model.contains("mythos") {
+        (10.0, 50.0)
+    } else if model.contains("opus") {
+        (5.0, 25.0)
+    } else if model.contains("sonnet-5") {
+        (2.0, 10.0)
+    } else if model.contains("sonnet") {
+        (3.0, 15.0)
+    } else if model.contains("haiku") {
+        (1.0, 5.0)
+    } else {
+        (5.0, 25.0)
+    };
+    usage.input_tokens as f64 / 1e6 * input_per_m + usage.output_tokens as f64 / 1e6 * output_per_m
+}
+
+fn abbreviated_cwd() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let text = cwd.display().to_string();
+    match text.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => text,
+    }
+}
+
+/// Current branch from `.git/HEAD`, without spawning git.
+fn current_git_branch() -> Option<String> {
+    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
+        .or_else(|| Some(head.trim().chars().take(8).collect())) // detached HEAD
 }
 
 fn entry_lines(entry: &Entry, _width: usize) -> Vec<Line<'_>> {

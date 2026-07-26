@@ -23,9 +23,12 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
-    TurnComplete {
+    /// Usage of one API round-trip; `input_tokens + output_tokens` of the
+    /// latest one approximates the current context size.
+    ApiUsage {
         usage: Usage,
     },
+    TurnComplete,
     Error(String),
 }
 
@@ -65,7 +68,6 @@ impl AgentLoop {
     pub async fn run(&mut self, user_input: String) -> Result<String> {
         self.messages.push(Message::user_text(user_input));
         let tools = self.registry.definitions();
-        let mut total_usage = Usage::default();
         let mut final_text = String::new();
 
         for _ in 0..MAX_ITERATIONS {
@@ -73,8 +75,9 @@ impl AgentLoop {
                 .client
                 .send(Some(self.system.clone()), self.messages.clone(), tools.clone())
                 .await?;
-            total_usage.input_tokens += response.usage.input_tokens;
-            total_usage.output_tokens += response.usage.output_tokens;
+            self.emit(AgentEvent::ApiUsage {
+                usage: response.usage.clone(),
+            });
 
             self.messages.push(Message {
                 role: Role::Assistant,
@@ -98,7 +101,7 @@ impl AgentLoop {
                 "refusal" => bail!("the model declined this request (stop_reason: refusal)"),
                 "max_tokens" => bail!("response was cut off by the max_tokens limit"),
                 _ => {
-                    self.emit(AgentEvent::TurnComplete { usage: total_usage });
+                    self.emit(AgentEvent::TurnComplete);
                     return Ok(final_text);
                 }
             }

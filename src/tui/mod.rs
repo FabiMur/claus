@@ -12,6 +12,12 @@ use crate::api::types::Usage;
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// What the UI sends to the agent task.
+pub enum UiCommand {
+    Prompt(String),
+    Clear,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     User,
@@ -41,7 +47,12 @@ pub struct App {
     context_window: u32,
     cwd: String,
     git_branch: Option<String>,
-    prompt_tx: mpsc::UnboundedSender<String>,
+    busy_since: Option<std::time::Instant>,
+    history: Vec<String>,
+    /// Index into `history` while browsing with ↑/↓; `None` = editing `draft`.
+    history_pos: Option<usize>,
+    draft: String,
+    prompt_tx: mpsc::UnboundedSender<UiCommand>,
     agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
 }
 
@@ -49,12 +60,12 @@ impl App {
     pub fn new(
         model: String,
         startup_notes: Vec<String>,
-        prompt_tx: mpsc::UnboundedSender<String>,
+        prompt_tx: mpsc::UnboundedSender<UiCommand>,
         agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) -> Self {
         let mut entries = vec![Entry {
             kind: Kind::Info,
-            text: "claus — terminal coding agent. Enter sends, Esc quits, ↑/↓ scroll.".to_string(),
+            text: "claus — terminal coding agent. Enter sends, /help for keys and commands.".to_string(),
         }];
         entries.extend(startup_notes.into_iter().map(|text| Entry { kind: Kind::Info, text }));
         let context_window = context_window_for(&model);
@@ -70,6 +81,10 @@ impl App {
             context_window,
             cwd: abbreviated_cwd(),
             git_branch: current_git_branch(),
+            busy_since: None,
+            history: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
             prompt_tx,
             agent_rx,
         }
@@ -122,20 +137,55 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Esc => return true,
+            // Esc quits only when idle, so a running turn can't be lost by accident.
+            KeyCode::Esc => return !self.busy,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.input.pop();
+                self.history_pos = None;
             }
-            KeyCode::Up => self.scroll_from_bottom += 1,
-            KeyCode::Down => self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1),
+            KeyCode::Up => self.history_back(),
+            KeyCode::Down => self.history_forward(),
             KeyCode::PageUp => self.scroll_from_bottom += 10,
             KeyCode::PageDown => self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10),
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.history_pos = None;
+            }
             _ => {}
         }
         false
+    }
+
+    fn history_back(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_pos {
+            None => {
+                self.draft = self.input.clone();
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(pos) => pos - 1,
+        };
+        self.history_pos = Some(next);
+        self.input = self.history[next].clone();
+    }
+
+    fn history_forward(&mut self) {
+        match self.history_pos {
+            None => {}
+            Some(pos) if pos + 1 < self.history.len() => {
+                self.history_pos = Some(pos + 1);
+                self.input = self.history[pos + 1].clone();
+            }
+            Some(_) => {
+                self.history_pos = None;
+                self.input = std::mem::take(&mut self.draft);
+            }
+        }
     }
 
     fn submit(&mut self) {
@@ -144,13 +194,37 @@ impl App {
             return;
         }
         self.input.clear();
+        self.history_pos = None;
         self.scroll_from_bottom = 0;
-        self.entries.push(Entry {
-            kind: Kind::User,
-            text: prompt.clone(),
-        });
-        self.busy = true;
-        let _ = self.prompt_tx.send(prompt);
+        self.history.push(prompt.clone());
+
+        match prompt.as_str() {
+            "/help" => self.entries.push(Entry {
+                kind: Kind::Info,
+                text: "keys: Enter send · ↑/↓ prompt history · PgUp/PgDn scroll · Esc quit (when idle) · Ctrl+C quit\n\
+                       commands: /clear reset conversation · /help this help\n\
+                       cli: `claus index` refresh the RAG index · `claus ask <q>` one-shot"
+                    .to_string(),
+            }),
+            "/clear" => {
+                let _ = self.prompt_tx.send(UiCommand::Clear);
+                self.entries.clear();
+                self.context_tokens = 0;
+                self.entries.push(Entry {
+                    kind: Kind::Info,
+                    text: "conversation cleared".to_string(),
+                });
+            }
+            _ => {
+                self.entries.push(Entry {
+                    kind: Kind::User,
+                    text: prompt.clone(),
+                });
+                self.busy = true;
+                self.busy_since = Some(std::time::Instant::now());
+                let _ = self.prompt_tx.send(UiCommand::Prompt(prompt));
+            }
+        }
     }
 
     fn handle_agent_event(&mut self, event: AgentEvent) {
@@ -186,13 +260,17 @@ impl App {
                 self.usage.input_tokens += usage.input_tokens;
                 self.usage.output_tokens += usage.output_tokens;
             }
-            AgentEvent::TurnComplete => self.busy = false,
+            AgentEvent::TurnComplete => {
+                self.busy = false;
+                self.busy_since = None;
+            }
             AgentEvent::Error(message) => {
                 self.entries.push(Entry {
                     kind: Kind::Error,
                     text: format!("error: {message}"),
                 });
                 self.busy = false;
+                self.busy_since = None;
             }
         }
     }
@@ -265,8 +343,9 @@ impl App {
         ));
 
         if self.busy {
+            let elapsed = self.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             spans.push(Span::styled(
-                format!("  {} working", SPINNER[self.spinner_tick % SPINNER.len()]),
+                format!("  {} working {elapsed}s", SPINNER[self.spinner_tick % SPINNER.len()]),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -330,13 +409,24 @@ fn entry_lines(entry: &Entry, _width: usize) -> Vec<Line<'_>> {
         _ => "",
     };
     let mut lines = Vec::new();
+    let mut in_code_block = false;
     for (i, text_line) in entry.text.lines().enumerate() {
+        // Markdown code fences in assistant replies get their own styling.
+        let is_fence = entry.kind == Kind::Assistant && text_line.trim_start().starts_with("```");
+        let line_style = if is_fence {
+            in_code_block = !in_code_block;
+            Style::default().fg(Color::DarkGray)
+        } else if in_code_block {
+            Style::default().fg(Color::Cyan)
+        } else {
+            style
+        };
         let content = if i == 0 {
             format!("{prefix}{text_line}")
         } else {
             text_line.to_string()
         };
-        lines.push(Line::from(Span::styled(content, style)));
+        lines.push(Line::from(Span::styled(content, line_style)));
     }
     if entry.kind == Kind::Assistant || entry.kind == Kind::User {
         lines.push(Line::from(""));

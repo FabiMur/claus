@@ -110,15 +110,20 @@ async fn cmd_tui() -> Result<()> {
         config.model.clone(),
         config.max_tokens,
     );
-    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<tui::UiCommand>();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let system = default_system_prompt(&root.display().to_string());
     let mut agent = AgentLoop::new(client, registry, system).with_events(event_tx.clone());
     tokio::spawn(async move {
-        while let Some(prompt) = prompt_rx.recv().await {
-            if let Err(error) = agent.run(prompt).await {
-                let _ = event_tx.send(AgentEvent::Error(format!("{error:#}")));
+        while let Some(command) = prompt_rx.recv().await {
+            match command {
+                tui::UiCommand::Prompt(prompt) => {
+                    if let Err(error) = agent.run(prompt).await {
+                        let _ = event_tx.send(AgentEvent::Error(format!("{error:#}")));
+                    }
+                }
+                tui::UiCommand::Clear => agent.clear(),
             }
         }
     });

@@ -58,6 +58,11 @@ impl AgentLoop {
         self
     }
 
+    /// Drop the conversation history, starting the next turn from scratch.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+
     fn emit(&self, event: AgentEvent) {
         if let Some(tx) = &self.events {
             let _ = tx.send(event);

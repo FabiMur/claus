@@ -71,9 +71,14 @@ async fn cmd_ask(question: String) -> Result<()> {
     );
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
+        use std::io::Write;
         while let Some(event) = event_rx.recv().await {
             match event {
-                AgentEvent::AssistantText(text) => println!("\n{text}"),
+                AgentEvent::TextDelta(fragment) => {
+                    print!("{fragment}");
+                    let _ = std::io::stdout().flush();
+                }
+                AgentEvent::AssistantText(_) => println!(),
                 AgentEvent::ToolCall { name, input } => {
                     let mut summary = input.to_string();
                     summary.truncate(120);

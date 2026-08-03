@@ -78,6 +78,7 @@ pub struct ApiRequest {
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+    pub stream: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

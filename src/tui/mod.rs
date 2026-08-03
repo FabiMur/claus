@@ -48,6 +48,8 @@ pub struct App {
     cwd: String,
     git_branch: Option<String>,
     busy_since: Option<std::time::Instant>,
+    /// Index of the entry currently being filled by streamed text deltas.
+    streaming_entry: Option<usize>,
     history: Vec<String>,
     /// Index into `history` while browsing with ↑/↓; `None` = editing `draft`.
     history_pos: Option<usize>,
@@ -82,6 +84,7 @@ impl App {
             cwd: abbreviated_cwd(),
             git_branch: current_git_branch(),
             busy_since: None,
+            streaming_entry: None,
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
@@ -230,10 +233,26 @@ impl App {
     fn handle_agent_event(&mut self, event: AgentEvent) {
         self.scroll_from_bottom = 0;
         match event {
-            AgentEvent::AssistantText(text) => self.entries.push(Entry {
-                kind: Kind::Assistant,
-                text,
-            }),
+            AgentEvent::TextDelta(fragment) => match self.streaming_entry {
+                Some(index) => self.entries[index].text.push_str(&fragment),
+                None => {
+                    self.entries.push(Entry {
+                        kind: Kind::Assistant,
+                        text: fragment,
+                    });
+                    self.streaming_entry = Some(self.entries.len() - 1);
+                }
+            },
+            // Finalize the streamed entry with the block's definitive text
+            // (deltas and final content are identical; this also splits
+            // multi-block replies correctly).
+            AgentEvent::AssistantText(text) => match self.streaming_entry.take() {
+                Some(index) => self.entries[index].text = text,
+                None => self.entries.push(Entry {
+                    kind: Kind::Assistant,
+                    text,
+                }),
+            },
             AgentEvent::ToolCall { name, input } => {
                 let mut summary = serde_json::to_string(&input).unwrap_or_default();
                 summary.truncate(100);

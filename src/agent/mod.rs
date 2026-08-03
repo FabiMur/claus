@@ -13,6 +13,9 @@ const MAX_ITERATIONS: usize = 50;
 /// Progress notifications emitted while a turn runs, consumed by the TUI.
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
+    /// A streamed fragment of the assistant's reply, in arrival order.
+    TextDelta(String),
+    /// The complete text of one finished reply block (finalizes the deltas).
     AssistantText(String),
     ToolCall {
         name: String,
@@ -76,9 +79,20 @@ impl AgentLoop {
         let mut final_text = String::new();
 
         for _ in 0..MAX_ITERATIONS {
+            let events = self.events.clone();
+            let mut on_delta = |fragment: &str| {
+                if let (Some(tx), false) = (&events, fragment.is_empty()) {
+                    let _ = tx.send(AgentEvent::TextDelta(fragment.to_string()));
+                }
+            };
             let response = self
                 .client
-                .send(Some(self.system.clone()), self.messages.clone(), tools.clone())
+                .send(
+                    Some(self.system.clone()),
+                    self.messages.clone(),
+                    tools.clone(),
+                    &mut on_delta,
+                )
                 .await?;
             self.emit(AgentEvent::ApiUsage {
                 usage: response.usage.clone(),

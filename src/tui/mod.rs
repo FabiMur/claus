@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::AgentEvent;
 use crate::api::types::Usage;
+use crate::tools::shell::PermissionGate;
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -16,6 +17,41 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 pub enum UiCommand {
     Prompt(String),
     Clear,
+}
+
+/// A shell command awaiting the user's y/n decision.
+pub struct PermissionRequest {
+    pub command: String,
+    pub reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Gate that forwards approval requests into the TUI's event loop.
+pub struct TuiGate {
+    requests: mpsc::UnboundedSender<PermissionRequest>,
+}
+
+impl TuiGate {
+    pub fn new(requests: mpsc::UnboundedSender<PermissionRequest>) -> Self {
+        Self { requests }
+    }
+}
+
+#[async_trait::async_trait]
+impl PermissionGate for TuiGate {
+    async fn approve(&self, command: &str) -> bool {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if self
+            .requests
+            .send(PermissionRequest {
+                command: command.to_string(),
+                reply,
+            })
+            .is_err()
+        {
+            return false; // UI is gone; deny by default
+        }
+        response.await.unwrap_or(false)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -54,8 +90,10 @@ pub struct App {
     /// Index into `history` while browsing with ↑/↓; `None` = editing `draft`.
     history_pos: Option<usize>,
     draft: String,
+    pending_permission: Option<PermissionRequest>,
     prompt_tx: mpsc::UnboundedSender<UiCommand>,
     agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    permission_rx: mpsc::UnboundedReceiver<PermissionRequest>,
 }
 
 impl App {
@@ -64,6 +102,7 @@ impl App {
         startup_notes: Vec<String>,
         prompt_tx: mpsc::UnboundedSender<UiCommand>,
         agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
+        permission_rx: mpsc::UnboundedReceiver<PermissionRequest>,
     ) -> Self {
         let mut entries = vec![Entry {
             kind: Kind::Info,
@@ -88,8 +127,10 @@ impl App {
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
+            pending_permission: None,
             prompt_tx,
             agent_rx,
+            permission_rx,
         }
     }
 
@@ -122,6 +163,11 @@ impl App {
                     }
                 }
                 Some(event) = self.agent_rx.recv() => self.handle_agent_event(event),
+                // Only take the next approval request once the current one is
+                // answered, so decisions can never race each other.
+                Some(request) = self.permission_rx.recv(), if self.pending_permission.is_none() => {
+                    self.pending_permission = Some(request);
+                }
                 _ = ticker.tick() => {
                     if self.busy {
                         self.spinner_tick = self.spinner_tick.wrapping_add(1);
@@ -137,6 +183,16 @@ impl App {
             return false;
         };
         if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        // A pending approval captures the keyboard: only y / n / Esc count.
+        if self.pending_permission.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.answer_permission(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.answer_permission(false),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
             return false;
         }
         match key.code {
@@ -159,6 +215,20 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn answer_permission(&mut self, allow: bool) {
+        if let Some(request) = self.pending_permission.take() {
+            self.entries.push(Entry {
+                kind: if allow { Kind::Info } else { Kind::Error },
+                text: format!(
+                    "shell {}: {}",
+                    if allow { "allowed" } else { "denied" },
+                    request.command
+                ),
+            });
+            let _ = request.reply.send(allow);
+        }
     }
 
     fn history_back(&mut self) {
@@ -325,6 +395,25 @@ impl App {
             Paragraph::new(format!("{}█", self.input)).block(Block::default().borders(Borders::ALL).title(" prompt "));
         frame.render_widget(input, input_area);
 
+        // A pending shell approval takes over the status line as a modal.
+        if let Some(request) = &self.pending_permission {
+            let modal = Line::from(vec![
+                Span::styled(
+                    " ⚠ shell wants to run: ",
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{} ", request.command),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  [y] allow · [n]/Esc deny", Style::default().fg(Color::Yellow)),
+            ]);
+            frame.render_widget(Paragraph::new(modal), status_area);
+            return;
+        }
         frame.render_widget(Paragraph::new(self.status_line()), status_area);
     }
 

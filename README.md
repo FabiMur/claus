@@ -36,7 +36,10 @@ cargo run -- ask "where is retry logic implemented?"
   back, until the model ends its turn. `dispatch_agent` spawns sub-agents with
   their own context (multi-agent, depth 1).
 - `src/tools` — tool trait + registry: file read/write/edit, shell, literal
-  search, RAG search, LSP navigation, MCP bridge.
+  search, RAG search, LSP navigation, MCP bridge. The shell tool sits behind a
+  permission gate: read-only commands (conservative allowlist, no shell
+  metacharacters) run directly; anything state-changing must be approved by the
+  user — a y/n modal in the TUI, a stdin prompt in `ask` mode.
 - `src/rag` — semantic chunking with tree-sitter (Rust/Python; line windows as
   fallback), `voyage-code-3` embeddings, one Qdrant collection per project,
   incremental re-indexing by blake3 content hash (`.claus/manifest.json`).

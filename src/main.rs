@@ -24,6 +24,7 @@ use crate::tools::Registry;
 use crate::tools::lsp::{LspDefinition, LspHover, LspManager, LspReferences};
 use crate::tools::mcp::register_mcp_tools;
 use crate::tools::rag::RagSearch;
+use crate::tools::shell::{ConsoleGate, PermissionGate};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,7 +60,7 @@ async fn cmd_index() -> Result<()> {
 async fn cmd_ask(question: String) -> Result<()> {
     let config = Config::from_env()?;
     let root = std::env::current_dir()?;
-    let (registry, notes) = build_registry(&config, &root).await;
+    let (registry, notes) = build_registry(&config, &root, Arc::new(ConsoleGate)).await;
     for note in notes {
         eprintln!("[claus] {note}");
     }
@@ -108,7 +109,8 @@ async fn cmd_ask(question: String) -> Result<()> {
 async fn cmd_tui() -> Result<()> {
     let config = Config::from_env()?;
     let root = std::env::current_dir()?;
-    let (registry, notes) = build_registry(&config, &root).await;
+    let (permission_tx, permission_rx) = mpsc::unbounded_channel();
+    let (registry, notes) = build_registry(&config, &root, Arc::new(tui::TuiGate::new(permission_tx))).await;
 
     let client = Client::new(
         config.anthropic_api_key.clone(),
@@ -133,7 +135,9 @@ async fn cmd_tui() -> Result<()> {
         }
     });
 
-    tui::App::new(config.model, notes, prompt_tx, event_rx).run().await
+    tui::App::new(config.model, notes, prompt_tx, event_rx, permission_rx)
+        .run()
+        .await
 }
 
 fn build_embedder(config: &Config) -> Result<Embedder> {
@@ -146,7 +150,7 @@ fn build_embedder(config: &Config) -> Result<Embedder> {
 
 /// Assemble the tool set. Optional capabilities (RAG, MCP) degrade to a
 /// startup note instead of failing the whole app.
-async fn build_registry(config: &Config, root: &Path) -> (Registry, Vec<String>) {
+async fn build_registry(config: &Config, root: &Path, gate: Arc<dyn PermissionGate>) -> (Registry, Vec<String>) {
     let mut registry = Registry::default();
     let mut notes = Vec::new();
 
@@ -154,7 +158,7 @@ async fn build_registry(config: &Config, root: &Path) -> (Registry, Vec<String>)
     registry.register(Arc::new(tools::fs::WriteFile));
     registry.register(Arc::new(tools::fs::EditFile));
     registry.register(Arc::new(tools::fs::ListDir));
-    registry.register(Arc::new(tools::shell::Shell));
+    registry.register(Arc::new(tools::shell::Shell::new(Some(gate))));
     registry.register(Arc::new(tools::search::SearchText));
 
     let lsp = LspManager::new(root.to_path_buf());

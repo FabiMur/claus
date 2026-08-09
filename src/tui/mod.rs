@@ -345,9 +345,8 @@ impl App {
                 });
             }
             AgentEvent::ApiUsage { usage } => {
-                self.context_tokens = usage.input_tokens + usage.output_tokens;
-                self.usage.input_tokens += usage.input_tokens;
-                self.usage.output_tokens += usage.output_tokens;
+                self.context_tokens = usage.context_tokens();
+                self.usage.add(&usage);
             }
             AgentEvent::TurnComplete => {
                 self.busy = false;
@@ -450,6 +449,17 @@ impl App {
             Style::default().fg(Color::Green),
         ));
 
+        // Share of session input tokens served from the prompt cache.
+        let cached = self.usage.cache_read_input_tokens as f64;
+        let total_input = (self.usage.input_tokens + self.usage.cache_creation_input_tokens) as f64 + cached;
+        if cached > 0.0 {
+            spans.push(Span::styled(" · ", dim));
+            spans.push(Span::styled(
+                format!("⚡{:.0}% cached", cached / total_input * 100.0),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
         if self.busy {
             let elapsed = self.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             spans.push(Span::styled(
@@ -467,6 +477,7 @@ fn context_window_for(model: &str) -> u32 {
 }
 
 /// Approximate cost in USD from (input, output) prices per million tokens.
+/// Cache writes bill at 1.25x input and cache reads at 0.1x input.
 fn session_cost_usd(model: &str, usage: &Usage) -> f64 {
     let (input_per_m, output_per_m) = if model.contains("fable") || model.contains("mythos") {
         (10.0, 50.0)
@@ -481,7 +492,10 @@ fn session_cost_usd(model: &str, usage: &Usage) -> f64 {
     } else {
         (5.0, 25.0)
     };
-    usage.input_tokens as f64 / 1e6 * input_per_m + usage.output_tokens as f64 / 1e6 * output_per_m
+    let input_tokens = usage.input_tokens as f64
+        + usage.cache_creation_input_tokens as f64 * 1.25
+        + usage.cache_read_input_tokens as f64 * 0.1;
+    input_tokens / 1e6 * input_per_m + usage.output_tokens as f64 / 1e6 * output_per_m
 }
 
 fn abbreviated_cwd() -> String {

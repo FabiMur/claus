@@ -6,7 +6,9 @@ use reqwest::Client as HttpClient;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::api::types::{ApiErrorBody, ApiRequest, ApiResponse, ContentBlock, Message, ToolDefinition, Usage};
+use crate::api::types::{
+    ApiErrorBody, ApiRequest, ApiResponse, ContentBlock, Message, SystemBlock, ToolDefinition, Usage,
+};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -49,6 +51,16 @@ impl Client {
         tools: Vec<ToolDefinition>,
         on_delta: OnDelta<'_>,
     ) -> Result<ApiResponse> {
+        // One cache breakpoint on the system block: the cached prefix covers
+        // the tool definitions and system prompt, which are resent verbatim on
+        // every iteration of the agent loop.
+        let system = system.map(|text| {
+            vec![SystemBlock {
+                kind: "text",
+                text,
+                cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+            }]
+        });
         let request = ApiRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -145,7 +157,11 @@ impl MessageAssembler {
         let event: Value = serde_json::from_str(data).with_context(|| format!("invalid SSE payload: {data}"))?;
         match event["type"].as_str().unwrap_or_default() {
             "message_start" => {
-                self.usage.input_tokens = event["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
+                let usage = &event["message"]["usage"];
+                self.usage.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
+                self.usage.cache_creation_input_tokens =
+                    usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32;
+                self.usage.cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32;
             }
             "content_block_start" => self.start_block(&event)?,
             "content_block_delta" => self.apply_delta(&event, on_delta)?,

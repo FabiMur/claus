@@ -69,12 +69,24 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
+/// System prompt as a content block, so it can carry a `cache_control`
+/// breakpoint: the cached prefix covers tools + system on every loop
+/// iteration, which is where most repeated input tokens live.
+#[derive(Debug, Serialize)]
+pub struct SystemBlock {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiRequest {
     pub model: String,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Vec<SystemBlock>>,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
@@ -92,6 +104,26 @@ pub struct ApiResponse {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens written to the prompt cache this request (billed at 1.25x input).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// Tokens served from the prompt cache this request (billed at 0.1x input).
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+}
+
+impl Usage {
+    /// Everything the model saw this request: approximates context size.
+    pub fn context_tokens(&self) -> u32 {
+        self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens + self.output_tokens
+    }
+
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+    }
 }
 
 #[derive(Debug, Deserialize)]

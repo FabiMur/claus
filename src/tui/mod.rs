@@ -17,6 +17,8 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 pub enum UiCommand {
     Prompt(String),
     Clear,
+    /// Cancel the turn that is currently running.
+    Interrupt,
 }
 
 /// A shell command awaiting the user's y/n decision.
@@ -196,8 +198,14 @@ impl App {
             return false;
         }
         match key.code {
-            // Esc quits only when idle, so a running turn can't be lost by accident.
-            KeyCode::Esc => return !self.busy,
+            // Esc interrupts a running turn; when idle it quits the app.
+            KeyCode::Esc => {
+                if self.busy {
+                    let _ = self.prompt_tx.send(UiCommand::Interrupt);
+                } else {
+                    return true;
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
@@ -274,7 +282,7 @@ impl App {
         match prompt.as_str() {
             "/help" => self.entries.push(Entry {
                 kind: Kind::Info,
-                text: "keys: Enter send · ↑/↓ prompt history · PgUp/PgDn scroll · Esc quit (when idle) · Ctrl+C quit\n\
+                text: "keys: Enter send · ↑/↓ prompt history · PgUp/PgDn scroll · Esc interrupt (working) / quit (idle) · Ctrl+C quit\n\
                        commands: /clear reset conversation · /help this help\n\
                        cli: `claus index` refresh the RAG index · `claus ask <q>` one-shot"
                     .to_string(),
@@ -352,6 +360,16 @@ impl App {
                 self.busy = false;
                 self.busy_since = None;
             }
+            AgentEvent::Interrupted => {
+                self.entries.push(Entry {
+                    kind: Kind::Info,
+                    text: "turn interrupted".to_string(),
+                });
+                self.busy = false;
+                self.busy_since = None;
+                self.streaming_entry = None;
+            }
+            AgentEvent::Info(text) => self.entries.push(Entry { kind: Kind::Info, text }),
             AgentEvent::Error(message) => {
                 self.entries.push(Entry {
                     kind: Kind::Error,

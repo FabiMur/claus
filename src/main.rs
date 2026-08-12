@@ -126,11 +126,25 @@ async fn cmd_tui() -> Result<()> {
         while let Some(command) = prompt_rx.recv().await {
             match command {
                 tui::UiCommand::Prompt(prompt) => {
-                    if let Err(error) = agent.run(prompt).await {
-                        let _ = event_tx.send(AgentEvent::Error(format!("{error:#}")));
+                    // Racing the turn against an Interrupt command lets Esc
+                    // cancel mid-flight; the dropped future leaves history in
+                    // a possibly invalid state that repair_interrupted fixes.
+                    let mut interrupted = false;
+                    tokio::select! {
+                        result = agent.run(prompt) => {
+                            if let Err(error) = result {
+                                let _ = event_tx.send(AgentEvent::Error(format!("{error:#}")));
+                            }
+                        }
+                        _ = wait_for_interrupt(&mut prompt_rx) => interrupted = true,
+                    }
+                    if interrupted {
+                        agent.repair_interrupted();
+                        let _ = event_tx.send(AgentEvent::Interrupted);
                     }
                 }
                 tui::UiCommand::Clear => agent.clear(),
+                tui::UiCommand::Interrupt => {} // nothing running
             }
         }
     });
@@ -138,6 +152,18 @@ async fn cmd_tui() -> Result<()> {
     tui::App::new(config.model, notes, prompt_tx, event_rx, permission_rx)
         .run()
         .await
+}
+
+/// Resolve only when an Interrupt arrives; other commands cannot be sent
+/// while a turn is running (the TUI blocks them), so they are ignored.
+async fn wait_for_interrupt(commands: &mut mpsc::UnboundedReceiver<tui::UiCommand>) {
+    loop {
+        match commands.recv().await {
+            Some(tui::UiCommand::Interrupt) => return,
+            Some(_) => continue,
+            None => std::future::pending::<()>().await, // channel closed: let the turn finish
+        }
+    }
 }
 
 fn build_embedder(config: &Config) -> Result<Embedder> {

@@ -23,6 +23,28 @@ const TEXT_EXTENSIONS: &[&str] = &[
 ];
 const MAX_FILE_BYTES: u64 = 1_000_000;
 const MANIFEST_PATH: &str = ".claus/manifest.json";
+const CHUNKS_PATH: &str = ".claus/chunks.jsonl";
+
+/// One indexed chunk, persisted locally as the BM25 corpus for hybrid search
+/// (Qdrant holds the same data, but lexical scoring needs it all in memory).
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct ChunkRecord {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+}
+
+/// Load the local chunk corpus written by the indexer (empty if not indexed).
+pub fn load_chunk_corpus(root: &Path) -> Vec<ChunkRecord> {
+    let Ok(content) = std::fs::read_to_string(root.join(CHUNKS_PATH)) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
 
 #[derive(Debug, Default)]
 pub struct IndexReport {
@@ -47,6 +69,11 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => HashMap::new(),
     };
+    // Sidecar BM25 corpus, keyed by file so unchanged files keep their chunks.
+    let mut corpus: HashMap<String, Vec<ChunkRecord>> = HashMap::new();
+    for record in load_chunk_corpus(root) {
+        corpus.entry(record.path.clone()).or_default().push(record);
+    }
 
     let mut report = IndexReport::default();
     let mut seen = Vec::new();
@@ -78,6 +105,18 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
         store.delete_file(&relative).await?;
         store.upsert_chunks(&relative, &chunks, vectors).await?;
 
+        corpus.insert(
+            relative.clone(),
+            chunks
+                .iter()
+                .map(|c| ChunkRecord {
+                    path: relative.clone(),
+                    start_line: c.start_line,
+                    end_line: c.end_line,
+                    text: c.text.clone(),
+                })
+                .collect(),
+        );
         manifest.insert(relative, hash);
         report.indexed_files += 1;
         report.chunks += chunks.len();
@@ -88,6 +127,7 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
     for path in gone {
         store.delete_file(&path).await?;
         manifest.remove(&path);
+        corpus.remove(&path);
         report.removed_files += 1;
     }
 
@@ -95,6 +135,12 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?).context("writing index manifest")?;
+    let corpus_lines: Vec<String> = corpus
+        .into_values()
+        .flatten()
+        .filter_map(|record| serde_json::to_string(&record).ok())
+        .collect();
+    std::fs::write(root.join(CHUNKS_PATH), corpus_lines.join("\n")).context("writing chunk corpus")?;
     Ok(report)
 }
 

@@ -10,14 +10,13 @@ use serde_json::json;
 use crate::rag::chunker::Chunk;
 use crate::rag::embedder::EMBEDDING_DIM;
 
-/// One retrieved chunk with its similarity score.
+/// One retrieved chunk, in similarity order (rank feeds the RRF fusion).
 #[derive(Clone, Debug)]
 pub struct SearchHit {
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
-    pub score: f32,
 }
 
 /// Vector store backed by a Qdrant collection (one collection per project).
@@ -113,7 +112,6 @@ impl Store {
                         .and_then(|v| v.as_str())
                         .cloned()
                         .unwrap_or_default(),
-                    score: point.score,
                 }
             })
             .collect();

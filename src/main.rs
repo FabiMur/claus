@@ -195,7 +195,7 @@ async fn build_registry(config: &Config, root: &Path, gate: Arc<dyn PermissionGa
     match build_embedder(config) {
         Ok(embedder) => match Store::connect(&config.qdrant_url, collection_name(root)).await {
             Ok(store) => {
-                registry.register(Arc::new(RagSearch::new(embedder, Arc::new(store))));
+                registry.register(Arc::new(RagSearch::new(embedder, Arc::new(store), root.to_path_buf())));
                 notes.push("rag_search ready (run `claus index` to refresh the index)".to_string());
             }
             Err(error) => notes.push(format!("rag_search disabled: {error:#}")),

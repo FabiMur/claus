@@ -144,6 +144,23 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
     Ok(report)
 }
 
+/// Whether a path would be picked up by the indexer — used by the file
+/// watcher to ignore churn in build artifacts, VCS metadata and our own
+/// manifest writes.
+pub fn is_indexable(path: &Path) -> bool {
+    let in_skipped_dir = path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name) || (name.starts_with('.') && name.len() > 1))
+    });
+    !in_skipped_dir
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| TEXT_EXTENSIONS.contains(&ext))
+}
+
 fn collect_files(root: &Path) -> Vec<PathBuf> {
     WalkDir::new(root)
         .into_iter()

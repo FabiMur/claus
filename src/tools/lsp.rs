@@ -47,13 +47,16 @@ impl LspManager {
         Ok(client)
     }
 
-    /// Common preamble for position-based requests: resolve, open, build params.
+    /// Common preamble for position-based requests: resolve, open, wait for
+    /// the server to finish indexing (else it answers with misleading empty
+    /// results), then build params.
     async fn position_params(&self, input: &Value) -> Result<(Arc<LspClient>, Value)> {
         let path = PathBuf::from(required_str(input, "path")?);
         let line = input["line"].as_u64().context("missing required parameter: line")?;
         let column = input["column"].as_u64().unwrap_or(1);
         let client = self.client_for(&path).await?;
         client.ensure_open(&path).await?;
+        client.wait_ready(std::time::Duration::from_secs(60)).await;
         let params = json!({
             "textDocument": {"uri": uri_for(&path)},
             "position": {"line": line.saturating_sub(1), "character": column.saturating_sub(1)}
@@ -118,6 +121,70 @@ impl Tool for LspReferences {
         params["context"] = json!({"includeDeclaration": true});
         let result = client.request("textDocument/references", params).await?;
         Ok(clip(format_locations(&result), MAX_OUTPUT))
+    }
+}
+
+pub struct LspDiagnostics(pub Arc<LspManager>);
+
+#[async_trait]
+impl Tool for LspDiagnostics {
+    fn name(&self) -> &str {
+        "lsp_diagnostics"
+    }
+
+    fn description(&self) -> &str {
+        "List compiler/analyzer diagnostics (errors, warnings) for a file via the language server."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the source file"}
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<String> {
+        let path = PathBuf::from(required_str(&input, "path")?);
+        let client = self.0.client_for(&path).await?;
+        client.ensure_open(&path).await?;
+        client.wait_ready(std::time::Duration::from_secs(60)).await;
+
+        // Diagnostics are pushed, not pulled: poll briefly for the server to
+        // publish after analysis settles.
+        let uri = uri_for(&path);
+        let mut diagnostics = None;
+        for _ in 0..20 {
+            diagnostics = client.diagnostics_for(&uri).await;
+            if diagnostics.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        let Some(Value::Array(items)) = diagnostics else {
+            return Ok("no diagnostics published for this file (it may be clean)".to_string());
+        };
+        if items.is_empty() {
+            return Ok("no diagnostics: the file is clean".to_string());
+        }
+        let formatted: Vec<String> = items
+            .iter()
+            .map(|diagnostic| {
+                let severity = match diagnostic["severity"].as_u64() {
+                    Some(1) => "error",
+                    Some(2) => "warning",
+                    Some(3) => "info",
+                    _ => "hint",
+                };
+                let line = diagnostic["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
+                let message = diagnostic["message"].as_str().unwrap_or_default();
+                format!("{line}: [{severity}] {message}")
+            })
+            .collect();
+        Ok(clip(formatted.join("\n"), MAX_OUTPUT))
     }
 }
 

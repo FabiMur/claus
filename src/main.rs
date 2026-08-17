@@ -21,7 +21,7 @@ use crate::rag::embedder::Embedder;
 use crate::rag::indexer::{collection_name, index_project, is_indexable};
 use crate::rag::store::Store;
 use crate::tools::Registry;
-use crate::tools::lsp::{LspDefinition, LspHover, LspManager, LspReferences};
+use crate::tools::lsp::{LspDefinition, LspDiagnostics, LspHover, LspManager, LspReferences};
 use crate::tools::mcp::register_mcp_tools;
 use crate::tools::rag::RagSearch;
 use crate::tools::shell::{ConsoleGate, PermissionGate};
@@ -254,7 +254,8 @@ async fn build_registry(
     let lsp = LspManager::new(root.to_path_buf());
     registry.register(Arc::new(LspDefinition(Arc::clone(&lsp))));
     registry.register(Arc::new(LspReferences(Arc::clone(&lsp))));
-    registry.register(Arc::new(LspHover(lsp)));
+    registry.register(Arc::new(LspHover(Arc::clone(&lsp))));
+    registry.register(Arc::new(LspDiagnostics(lsp)));
 
     match build_embedder(config) {
         Ok(embedder) => match Store::connect(&config.qdrant_url, collection_name(root)).await {

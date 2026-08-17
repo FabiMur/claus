@@ -20,6 +20,11 @@ pub struct LspClient {
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     next_id: AtomicI64,
     opened: Mutex<HashSet<String>>,
+    /// Work-done progress tokens currently active (server is indexing/analyzing).
+    active_progress: Arc<Mutex<HashSet<String>>>,
+    /// Latest diagnostics published per document uri.
+    diagnostics: Arc<Mutex<HashMap<String, Value>>>,
+    started_at: std::time::Instant,
     _child: Child,
 }
 
@@ -45,6 +50,9 @@ impl LspClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicI64::new(1),
             opened: Mutex::new(HashSet::new()),
+            active_progress: Arc::new(Mutex::new(HashSet::new())),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            started_at: std::time::Instant::now(),
             _child: child,
         });
 
@@ -59,9 +67,11 @@ impl LspClient {
                     "rootUri": root_uri,
                     "workspaceFolders": [{"uri": root_uri, "name": "workspace"}],
                     "capabilities": {
+                        "window": {"workDoneProgress": true},
                         "textDocument": {
                             "hover": {"contentFormat": ["plaintext", "markdown"]},
-                            "definition": {}, "references": {}
+                            "definition": {}, "references": {},
+                            "publishDiagnostics": {}
                         }
                     }
                 }),
@@ -96,8 +106,63 @@ impl LspClient {
                 let reply = json!({"jsonrpc": "2.0", "id": id, "result": Value::Null});
                 let _ = client.write_message(&reply).await;
             }
-            // Notifications (diagnostics, progress) are ignored.
+            match message.get("method").and_then(|m| m.as_str()) {
+                // Track indexing/analysis progress so tools can wait for
+                // readiness instead of returning misleading empty results.
+                Some("$/progress") => {
+                    let params = &message["params"];
+                    let token = params["token"].to_string();
+                    match params["value"]["kind"].as_str() {
+                        Some("begin") => {
+                            client.active_progress.lock().await.insert(token);
+                        }
+                        Some("end") => {
+                            client.active_progress.lock().await.remove(&token);
+                        }
+                        _ => {}
+                    }
+                }
+                Some("textDocument/publishDiagnostics") => {
+                    let params = &message["params"];
+                    if let Some(uri) = params["uri"].as_str() {
+                        client
+                            .diagnostics
+                            .lock()
+                            .await
+                            .insert(uri.to_string(), params["diagnostics"].clone());
+                    }
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// Wait until the server has no active work-done progress (indexing,
+    /// analysis). Servers report progress shortly after startup, so also hold
+    /// a short grace period before trusting an empty progress set.
+    pub async fn wait_ready(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let grace = self.started_at + Duration::from_secs(2);
+        let mut quiet_checks = 0;
+        while tokio::time::Instant::now() < deadline {
+            let busy = !self.active_progress.lock().await.is_empty();
+            if busy {
+                quiet_checks = 0;
+            } else if std::time::Instant::now() >= grace {
+                quiet_checks += 1;
+                // Require sustained quiet so a begin/end gap is not mistaken
+                // for readiness.
+                if quiet_checks >= 3 {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Latest diagnostics the server published for a document, if any.
+    pub async fn diagnostics_for(&self, uri: &str) -> Option<Value> {
+        self.diagnostics.lock().await.get(uri).cloned()
     }
 
     async fn write_message(&self, message: &Value) -> Result<()> {

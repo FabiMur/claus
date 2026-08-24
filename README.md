@@ -31,20 +31,30 @@ cargo run -- ask "where is retry logic implemented?"
 ## How it works
 
 - `src/api` — Messages API client: typed content blocks (text, thinking,
-  tool_use, tool_result), retries with backoff. No SDK, plain REST.
+  tool_use, tool_result), hand-written SSE streaming (responses render token
+  by token), retries with backoff, and prompt caching (a `cache_control`
+  breakpoint on the system prompt covers the tools + system prefix on every
+  loop iteration; cache reads/writes are tracked and priced in the status bar).
+  No SDK, plain REST.
 - `src/agent` — the agent loop: send → execute requested tools → feed results
   back, until the model ends its turn. `dispatch_agent` spawns sub-agents with
-  their own context (multi-agent, depth 1).
+  their own context (multi-agent, depth 1). Turns can be interrupted with Esc
+  (dangling tool calls are repaired so the history stays API-valid), and old
+  tool results are cleared automatically when the context grows past budget.
 - `src/tools` — tool trait + registry: file read/write/edit, shell, literal
   search, RAG search, LSP navigation, MCP bridge. The shell tool sits behind a
   permission gate: read-only commands (conservative allowlist, no shell
   metacharacters) run directly; anything state-changing must be approved by the
   user — a y/n modal in the TUI, a stdin prompt in `ask` mode.
-- `src/rag` — semantic chunking with tree-sitter (Rust/Python; line windows as
-  fallback), `voyage-code-3` embeddings, one Qdrant collection per project,
-  incremental re-indexing by blake3 content hash (`.claus/manifest.json`).
+- `src/rag` — hybrid search: semantic chunking with tree-sitter (Rust/Python;
+  line windows as fallback), `voyage-code-3` embeddings in one Qdrant
+  collection per project, plus a hand-written BM25 index over the same chunks;
+  results are combined with reciprocal rank fusion. Re-indexing is incremental
+  by blake3 content hash and runs automatically via a file watcher.
 - `src/lsp` — minimal LSP client (JSON-RPC over stdio, Content-Length framing):
-  definition, references, hover.
+  definition, references, hover and diagnostics. Requests wait for the server
+  to finish indexing (`$/progress` tracking) instead of returning empty
+  results while it warms up.
 - `src/mcp` — MCP stdio client: declare servers in `.claus/mcp.json`
   (`{"servers": {"name": {"command": "npx", "args": ["-y", "..."]}}}`); their
   tools appear to the agent as `mcp__<server>__<tool>`.

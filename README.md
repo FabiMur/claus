@@ -1,5 +1,7 @@
 # claus
 
+[![CI](https://github.com/FabiMur/claus/actions/workflows/ci.yml/badge.svg)](https://github.com/FabiMur/claus/actions/workflows/ci.yml)
+
 Terminal coding agent built from scratch in Rust. A ratatui chat TUI drives a
 multi-agent loop with tool calling implemented directly against the Anthropic
 Messages REST API. Codebase context is retrieved via RAG (tree-sitter semantic

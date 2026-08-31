@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use crate::rag::chunker::chunk_source;
+use crate::rag::chunker::{Chunk, chunk_source};
 use crate::rag::embedder::{Embedder, InputType};
 use crate::rag::store::Store;
 
@@ -61,8 +61,19 @@ pub fn collection_name(project_root: &Path) -> String {
     format!("claus-{}", &hash.to_hex()[..12])
 }
 
+/// One changed file waiting to be embedded, together with the offset of its
+/// chunk texts inside the run's single batched embedding request.
+struct Pending {
+    relative: String,
+    hash: String,
+    chunks: Vec<Chunk>,
+    offset: usize,
+}
+
 /// Incrementally index the project: only files whose content hash changed are
-/// re-chunked, re-embedded and re-upserted; deleted files are purged.
+/// re-chunked, re-embedded and re-upserted; deleted files are purged. Chunks
+/// from every changed file are embedded in a single batched pass, so a run
+/// costs a handful of requests instead of one per file.
 pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> Result<IndexReport> {
     let manifest_file = root.join(MANIFEST_PATH);
     let mut manifest: HashMap<String, String> = match std::fs::read_to_string(&manifest_file) {
@@ -77,6 +88,8 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
 
     let mut report = IndexReport::default();
     let mut seen = Vec::new();
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
 
     for path in collect_files(root) {
         let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
@@ -84,6 +97,8 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
             continue; // non-UTF-8 despite the extension filter
         };
         let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        // Every readable file counts as seen, even when it is unchanged or
+        // yields no chunks, or the purge below would drop a live file.
         seen.push(relative.clone());
 
         if manifest.get(&relative) == Some(&hash) {
@@ -94,32 +109,60 @@ pub async fn index_project(root: &Path, embedder: &Embedder, store: &Store) -> R
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
         let chunks = chunk_source(extension, &content);
         if chunks.is_empty() {
-            continue;
+            continue; // nothing to embed: stays out of the manifest, retried next run
         }
-        let texts: Vec<String> = chunks
-            .iter()
-            .map(|c| format!("// {relative}:{}\n{}", c.start_line, c.text))
-            .collect();
-        let vectors = embedder.embed(&texts, InputType::Document).await?;
-
-        store.delete_file(&relative).await?;
-        store.upsert_chunks(&relative, &chunks, vectors).await?;
-
-        corpus.insert(
-            relative.clone(),
+        let offset = texts.len();
+        texts.extend(
             chunks
                 .iter()
-                .map(|c| ChunkRecord {
-                    path: relative.clone(),
-                    start_line: c.start_line,
-                    end_line: c.end_line,
-                    text: c.text.clone(),
+                .map(|chunk| format!("// {relative}:{}\n{}", chunk.start_line, chunk.text)),
+        );
+        pending.push(Pending {
+            relative,
+            hash,
+            chunks,
+            offset,
+        });
+    }
+
+    // One embedding pass for the whole run; `Embedder::embed` splits it into
+    // requests of at most BATCH_SIZE chunks / MAX_BATCH_CHARS characters.
+    let vectors = if texts.is_empty() {
+        Vec::new()
+    } else {
+        embedder.embed(&texts, InputType::Document).await?
+    };
+    anyhow::ensure!(
+        vectors.len() == texts.len(),
+        "embedder returned {} vectors for {} chunk texts",
+        vectors.len(),
+        texts.len()
+    );
+
+    for file in pending {
+        // Slice by the recorded offset: `upsert_chunks` zips chunks with
+        // vectors, so a misaligned slice would silently pair a chunk with
+        // another chunk's embedding instead of failing.
+        let file_vectors = vectors[file.offset..file.offset + file.chunks.len()].to_vec();
+
+        store.delete_file(&file.relative).await?;
+        store.upsert_chunks(&file.relative, &file.chunks, file_vectors).await?;
+
+        corpus.insert(
+            file.relative.clone(),
+            file.chunks
+                .iter()
+                .map(|chunk| ChunkRecord {
+                    path: file.relative.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    text: chunk.text.clone(),
                 })
                 .collect(),
         );
-        manifest.insert(relative, hash);
         report.indexed_files += 1;
-        report.chunks += chunks.len();
+        report.chunks += file.chunks.len();
+        manifest.insert(file.relative, file.hash);
     }
 
     // Purge vectors of files that no longer exist.

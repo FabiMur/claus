@@ -8,6 +8,25 @@ Messages REST API. Codebase context is retrieved via RAG (tree-sitter semantic
 chunking, Voyage AI embeddings, Qdrant vector search), code navigation goes
 through the Language Server Protocol, and external tool servers plug in via MCP.
 
+## Demo
+
+The agent loop: a question, hybrid retrieval over the indexed codebase, and a
+streamed answer. Tool activity and the running token/cost tally render as they
+happen.
+
+![claus answering a question about its own SSE handling: two rag_search calls and a read_file, streaming into a reply](tapes/01-agent-loop.gif)
+
+Shell commands are classified before they run. `cargo test` is allowlisted and
+executes straight away; `cargo clean` is not, so it stops at a y/n gate — denied
+here, and the agent reports back without it.
+
+![claus running cargo test unprompted, then stopping at a permission modal for cargo clean and reporting the denial](tapes/02-permission-gate.gif)
+
+The index keeps itself current. Editing a file outside the TUI triggers a
+debounced, content-hashed re-index of just that file.
+
+![claus explaining its blake3 manifest, then reporting reindexed 1 changed file after an external edit](tapes/03-rag-reindex.gif)
+
 ## Requirements
 
 - Rust (stable, via rustup)
